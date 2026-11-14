@@ -2,18 +2,23 @@ package com.walite.browser
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.text.TextUtils
 import android.util.Base64
 import android.util.TypedValue
 import android.view.Gravity
@@ -24,6 +29,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -31,6 +37,7 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -44,6 +51,7 @@ import androidx.webkit.WebViewFeature
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.zip.ZipInputStream
 
@@ -52,14 +60,24 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val WHATSAPP_WEB_URL = "https://web.whatsapp.com"
         private const val TELEGRAM_WEB_URL = "https://web.telegram.org"
-        private val ALLOWED_HOSTS = setOf("web.whatsapp.com", "web.telegram.org", "oauth.telegram.org")
+        private const val EXT_VIRTUAL_HOST = "walite-ext.local"
+        private val ALLOWED_HOSTS = setOf(
+            "web.whatsapp.com",
+            "web.telegram.org",
+            "oauth.telegram.org",
+            EXT_VIRTUAL_HOST
+        )
         private const val DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         private const val MOBILE_UA =
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+
         private const val CHROMIUM_DESKTOP_SHIM = """
             (function() {
               try {
+                const bridge = window.__waliteNative;
+                const isDesk = bridge ? bridge.isDesktopMode() : true;
+                if (!isDesk) return;
                 Object.defineProperty(navigator, 'platform', { get: () => 'Win32', configurable: true });
                 Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0, configurable: true });
                 Object.defineProperty(navigator, 'userAgentData', {
@@ -85,6 +103,7 @@ class MainActivity : AppCompatActivity() {
               } catch (e) {}
             })();
         """
+
         private const val CHROME_API_SHIM = """
             (function() {
               if (window.__waliteChromeReady) return;
@@ -167,25 +186,51 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webContainer: FrameLayout
     private lateinit var waWebView: WebView
     private var tgWebView: WebView? = null
+
     private lateinit var popupCard: LinearLayout
     private lateinit var popupWebView: WebView
     private lateinit var popupTitleView: TextView
+    private lateinit var disabledNoticeBox: LinearLayout
+    private lateinit var disabledNoticeText: TextView
+
+    private lateinit var panelCard: LinearLayout
+    private lateinit var panelTabPermsBtn: Button
+    private lateinit var panelTabExtBtn: Button
+    private lateinit var panelPermsBody: LinearLayout
+    private lateinit var panelExtBody: LinearLayout
+    private lateinit var micStatusText: TextView
+    private lateinit var camStatusText: TextView
+    private lateinit var btStatusText: TextView
+    private lateinit var audioDevicesText: TextView
+    private lateinit var audioRouteBtn: Button
+    private lateinit var extStatusText: TextView
+    private lateinit var extTogglePopupBtn: Button
+
+    private lateinit var backBtn: Button
+    private lateinit var reloadBtn: Button
     private lateinit var waSwitchBtn: Button
     private lateinit var tgSwitchBtn: Button
     private lateinit var desktopBtn: Button
     private lateinit var permsBtn: Button
-    private lateinit var extBtn: Button
+    private lateinit var extNameBtn: Button
+    private lateinit var addZipBtn: Button
+    private lateinit var posBtn: Button
 
     private var activeSite = "wa"
     private var desktopSite = true
-    private var toolbarAtBottom = true
+    private var toolbarAtBottom = false
     private var isPopupOpen = false
+    private var isPanelOpen = false
+    private var activePanelTab = "perms"
     private var isExtPopupEnabled = true
     private var useHeadphones = true
+
+    private var hasInstalledExtension = false
     private var installedBaseDir: File? = null
-    private var installedPopupFile: File? = null
+    private var installedPopupRel: String? = null
     private var installedManifestText: String = "{}"
     private var installedExtName: String = "Extension"
+    private var installedExtVersion: String = "1.0"
     private var contentJsFiles: List<File> = emptyList()
     private var contentCssFiles: List<File> = emptyList()
     private var pendingPermissionRequest: PermissionRequest? = null
@@ -204,7 +249,7 @@ class MainActivity : AppCompatActivity() {
                 req.deny()
             }
         }
-        updatePermsButtonBadge()
+        refreshPanelUi()
     }
 
     private val extensionZipPicker = registerForActivityResult(
@@ -216,6 +261,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun dp(value: Int): Int =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics).toInt()
+
+    private fun makeRoundedBg(fillHex: String, strokeHex: String = "#293548", radiusDp: Int = 8): GradientDrawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(radiusDp).toFloat()
+            setColor(Color.parseColor(fillHex))
+            setStroke(dp(1), Color.parseColor(strokeHex))
+        }
+    }
+
+    private fun styleButton(btn: Button, fillHex: String, strokeHex: String = "#293548") {
+        btn.background = makeRoundedBg(fillHex, strokeHex, 8)
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -252,31 +310,34 @@ class MainActivity : AppCompatActivity() {
         popupCard.visibility = View.GONE
         webContainer.addView(popupCard)
 
+        panelCard = buildChromiumDrawerOverlay()
+        panelCard.visibility = View.GONE
+        webContainer.addView(panelCard)
+
         toolbar = buildCleanToolbar()
         toolbarScroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
             isFillViewport = true
-            setBackgroundColor(Color.parseColor("#111720"))
+            setBackgroundColor(Color.parseColor("#0E141B"))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(62)
+                dp(58)
             )
             addView(toolbar)
         }
 
-        rootLayout.addView(webContainer)
         rootLayout.addView(toolbarScroll)
+        rootLayout.addView(webContainer)
         setContentView(rootLayout)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 val activeWv = getActiveWebView()
-                if (isPopupOpen) {
-                    closePopup()
-                } else if (activeWv.canGoBack()) {
-                    activeWv.goBack()
-                } else {
-                    finish()
+                when {
+                    isPanelOpen -> closePanel()
+                    isPopupOpen -> closePopup()
+                    activeWv.canGoBack() -> activeWv.goBack()
+                    else -> finish()
                 }
             }
         })
@@ -284,22 +345,27 @@ class MainActivity : AppCompatActivity() {
         requestRequiredPermissions()
         applyAudioRouting(true)
         restoreSavedExtension()
+        refreshExtensionToolbarButton()
+        refreshPanelUi()
         waWebView.loadUrl(WHATSAPP_WEB_URL)
     }
 
     inner class WaliteChromeBridge {
+        @JavascriptInterface
+        fun isDesktopMode(): Boolean = desktopSite
+
         @JavascriptInterface
         fun getAllStorage(): String {
             val obj = JSONObject()
             for ((k, v) in extPrefs.all) {
                 if (v is String) {
                     try {
-                        obj.put(k, JSONObject(v).opt("v"))
+                        obj.put(k, JSONObject(v).opt("v") ?: JSONObject.NULL)
                     } catch (_: Exception) {
                         obj.put(k, v)
                     }
                 } else {
-                    obj.put(k, v)
+                    obj.put(k, v ?: JSONObject.NULL)
                 }
             }
             return obj.toString()
@@ -335,8 +401,8 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun getExtUrl(rel: String): String {
-            val dir = installedBaseDir ?: return rel
-            return "file://" + File(dir, rel.trimStart('/')).absolutePath
+            val clean = rel.trimStart('/')
+            return "https://$EXT_VIRTUAL_HOST/$clean"
         }
 
         @JavascriptInterface
@@ -348,6 +414,46 @@ class MainActivity : AppCompatActivity() {
                 tgWebView?.evaluateJavascript(script, null)
                 popupWebView.evaluateJavascript(script, null)
             }
+        }
+    }
+
+    private fun interceptExtensionAsset(request: WebResourceRequest?): WebResourceResponse? {
+        val uri = request?.url ?: return null
+        if (!EXT_VIRTUAL_HOST.equals(uri.host, ignoreCase = true)) return null
+        val baseDir = installedBaseDir ?: return WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", emptyMap(), null)
+        val relPath = (uri.path ?: "").trimStart('/')
+        if (relPath.isEmpty() || relPath.contains("..")) return null
+        return try {
+            val target = File(baseDir, relPath)
+            val baseCanon = baseDir.canonicalPath
+            val targetCanon = target.canonicalPath
+            if ((targetCanon == baseCanon || targetCanon.startsWith(baseCanon + File.separator)) && target.exists() && target.isFile) {
+                val ext = target.extension.lowercase()
+                val mime = when (ext) {
+                    "js", "mjs" -> "application/javascript"
+                    "css" -> "text/css"
+                    "html", "htm" -> "text/html"
+                    "json" -> "application/json"
+                    "png" -> "image/png"
+                    "jpg", "jpeg" -> "image/jpeg"
+                    "svg" -> "image/svg+xml"
+                    "webp" -> "image/webp"
+                    "mp3" -> "audio/mpeg"
+                    "wav" -> "audio/wav"
+                    "ogg" -> "audio/ogg"
+                    "wasm" -> "application/wasm"
+                    else -> "application/octet-stream"
+                }
+                val headers = mapOf(
+                    "Access-Control-Allow-Origin" to "*",
+                    "Access-Control-Allow-Methods" to "GET, OPTIONS"
+                )
+                WebResourceResponse(mime, "UTF-8", 200, "OK", headers, FileInputStream(target))
+            } else {
+                WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", emptyMap(), null)
+            }
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -371,8 +477,8 @@ class MainActivity : AppCompatActivity() {
         }
         waWebView.visibility = if (nextSite == "wa") View.VISIBLE else View.GONE
         tgWebView?.visibility = if (nextSite == "tg") View.VISIBLE else View.GONE
-        waSwitchBtn.setBackgroundColor(Color.parseColor(if (nextSite == "wa") "#16A34A" else "#1E293B"))
-        tgSwitchBtn.setBackgroundColor(Color.parseColor(if (nextSite == "tg") "#0284C7" else "#1E293B"))
+        styleButton(waSwitchBtn, if (nextSite == "wa") "#16A34A" else "#161E29", if (nextSite == "wa") "#22C55E" else "#293548")
+        styleButton(tgSwitchBtn, if (nextSite == "tg") "#0284C7" else "#161E29", if (nextSite == "tg") "#38BDF8" else "#293548")
     }
 
     private fun requiredPermissionsList(): List<String> {
@@ -396,7 +502,7 @@ class MainActivity : AppCompatActivity() {
         if (missing.isNotEmpty()) {
             permissionLauncher.launch(missing.toTypedArray())
         }
-        updatePermsButtonBadge()
+        refreshPanelUi()
     }
 
     private fun applyAudioRouting(preferHeadphones: Boolean) {
@@ -434,50 +540,108 @@ class MainActivity : AppCompatActivity() {
                 am.isBluetoothScoOn = true
             }
         } catch (_: Exception) {}
+        refreshPanelUi()
     }
 
-    private fun updatePermsButtonBadge() {
-        if (!::permsBtn.isInitialized) return
-        val micOk = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-        val camOk = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-        permsBtn.setBackgroundColor(Color.parseColor(if (micOk && camOk) "#16A34A" else "#B91C1C"))
+    private fun describeAudioDevices(): String {
+        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return "AudioManager unavailable"
+        val inputs = am.getDevices(AudioManager.GET_DEVICES_INPUTS).map { dev ->
+            val label = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) dev.productName.toString() else "Mic"
+            "• Input: $label (${deviceTypeName(dev.type)})"
+        }
+        val outputs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).map { dev ->
+            val label = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) dev.productName.toString() else "Output"
+            "• Output: $label (${deviceTypeName(dev.type)})"
+        }
+        return (inputs + outputs).ifEmpty { listOf("No external audio devices detected") }.joinToString("\n")
     }
 
-    private fun showPermissionsAndAudioDialog() {
+    private fun deviceTypeName(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Phone Mic"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Phone Speaker"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Wired Headset"
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "Wired Headphones"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth Call"
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth Media"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "USB Headset"
+        else -> "Audio"
+    }
+
+    private fun playHeadphoneTestChime() {
+        try {
+            val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 85)
+            tg.startTone(ToneGenerator.TONE_PROP_BEEP2, 300)
+            Handler(Looper.getMainLooper()).postDelayed({
+                try { tg.release() } catch (_: Exception) {}
+            }, 400)
+            Toast.makeText(
+                this,
+                if (useHeadphones) "Played chime to Headphones / BT" else "Played chime to Speaker",
+                Toast.LENGTH_SHORT
+            ).show()
+        } catch (_: Exception) {
+            Toast.makeText(this, "Could not play audio chime", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun refreshPanelUi() {
         val micOk = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val camOk = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         val btOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
         } else true
 
-        val statusText = buildString {
-            appendLine("Microphone: " + if (micOk) "Allowed" else "Blocked (Tap Grant)")
-            appendLine("Camera: " + if (camOk) "Allowed" else "Blocked (Tap Grant)")
-            appendLine("Bluetooth Headset: " + if (btOk) "Allowed" else "Blocked")
-            appendLine("Audio Output: " + if (useHeadphones) "Headphones / Bluetooth" else "Phone Speaker")
+        if (::permsBtn.isInitialized) {
+            styleButton(
+                permsBtn,
+                if (micOk && camOk) "#16A34A" else "#B91C1C",
+                if (micOk && camOk) "#22C55E" else "#EF4444"
+            )
         }
+        if (::micStatusText.isInitialized) {
+            micStatusText.text = "Microphone: " + if (micOk) "Allowed (Hardware Active)" else "Blocked — Tap Grant"
+            micStatusText.setTextColor(Color.parseColor(if (micOk) "#4ADE80" else "#FCA5A5"))
+            camStatusText.text = "Camera: " + if (camOk) "Allowed" else "Blocked — Tap Grant"
+            camStatusText.setTextColor(Color.parseColor(if (camOk) "#4ADE80" else "#FCA5A5"))
+            btStatusText.text = "Bluetooth Audio: " + if (btOk) "Allowed" else "Tap Grant for BT Headset"
+            audioDevicesText.text = describeAudioDevices()
+            audioRouteBtn.text = if (useHeadphones) "Output: Headphones / BT (Tap to Speaker)" else "Output: Phone Speaker (Tap to Headphones)"
+        }
+        if (::extStatusText.isInitialized) {
+            extStatusText.text = if (hasInstalledExtension) {
+                "$installedExtName (v$installedExtVersion)\nContent scripts: ${contentJsFiles.size} JS / ${contentCssFiles.size} CSS\nPopup state: " +
+                    if (isExtPopupEnabled) "Enabled" else "Disabled Popup"
+            } else {
+                "No Chrome extension .zip installed yet. Tap +Zip to install."
+            }
+            extTogglePopupBtn.visibility = if (hasInstalledExtension) View.VISIBLE else View.GONE
+            extTogglePopupBtn.text = if (isExtPopupEnabled) "Disable Popup" else "Enable Popup"
+            styleButton(
+                extTogglePopupBtn,
+                if (isExtPopupEnabled) "#92400E" else "#16A34A",
+                if (isExtPopupEnabled) "#D97706" else "#22C55E"
+            )
+        }
+    }
 
-        AlertDialog.Builder(this)
-            .setTitle("Permissions & Audio Routing")
-            .setMessage(statusText)
-            .setPositiveButton(if (useHeadphones) "Switch to Speaker" else "Use Headphones / BT") { _, _ ->
-                applyAudioRouting(!useHeadphones)
-                Toast.makeText(
-                    this,
-                    if (useHeadphones) "Audio routed to Headphones / BT" else "Audio routed to Speakerphone",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-            .setNeutralButton("Grant Permissions") { _, _ ->
-                requestRequiredPermissions()
-            }
-            .setNegativeButton("App Settings") { _, _ ->
-                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                    data = Uri.fromParts("package", packageName, null)
-                }
-                startActivity(intent)
-            }
-            .show()
+    private fun refreshExtensionToolbarButton() {
+        if (!::extNameBtn.isInitialized) return
+        if (!hasInstalledExtension) {
+            extNameBtn.visibility = View.GONE
+            return
+        }
+        extNameBtn.visibility = View.VISIBLE
+        val shortName = installedExtName.take(11)
+        if (!isExtPopupEnabled) {
+            extNameBtn.text = "$shortName (Off)"
+            styleButton(extNameBtn, "#78350F", "#D97706")
+        } else if (isPopupOpen) {
+            extNameBtn.text = shortName
+            styleButton(extNameBtn, "#16A34A", "#22C55E")
+        } else {
+            extNameBtn.text = shortName
+            styleButton(extNameBtn, "#161E29", "#293548")
+        }
     }
 
     private fun installExtensionFromUri(uri: Uri) {
@@ -511,10 +675,13 @@ class MainActivity : AppCompatActivity() {
             }
 
             if (loadInstalledExtensionFromDir(extRoot)) {
-                openPopup()
-                Toast.makeText(this, "Installed extension: $installedExtName", Toast.LENGTH_SHORT).show()
+                if (installedPopupRel != null) {
+                    openPopup()
+                } else {
+                    Toast.makeText(this, "Installed scripts from $installedExtName", Toast.LENGTH_SHORT).show()
+                }
             } else {
-                Toast.makeText(this, "No manifest.json or popup.html found inside .zip", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "No manifest.json found inside .zip", Toast.LENGTH_LONG).show()
             }
         } catch (e: Exception) {
             Toast.makeText(this, "ZIP extension error: ${e.message}", Toast.LENGTH_LONG).show()
@@ -536,11 +703,13 @@ class MainActivity : AppCompatActivity() {
         installedBaseDir = baseDir
         installedManifestText = rawManifest
         installedExtName = json.optString("name", "Extension")
+        installedExtVersion = json.optString("version", "1.0")
+        hasInstalledExtension = true
+
         val actionObj = json.optJSONObject("action") ?: json.optJSONObject("browser_action")
-        val popupRel = actionObj?.optString("default_popup", "")?.takeIf { it.isNotBlank() }
-            ?: "popup.html"
-        val popupFile = File(baseDir, popupRel)
-        if (!popupFile.exists()) return false
+        val candidatePopup = actionObj?.optString("default_popup", "")?.trimStart('/')?.takeIf { it.isNotBlank() }
+            ?: if (File(baseDir, "popup.html").exists()) "popup.html" else null
+        installedPopupRel = if (candidatePopup != null && File(baseDir, candidatePopup).exists()) candidatePopup else null
 
         val jsList = mutableListOf<File>()
         val cssList = mutableListOf<File>()
@@ -566,20 +735,37 @@ class MainActivity : AppCompatActivity() {
         }
         contentJsFiles = jsList
         contentCssFiles = cssList
-
-        installedPopupFile = popupFile
         isExtPopupEnabled = true
+
         popupTitleView.text = installedExtName
-        extBtn.text = installedExtName.take(8)
-        popupWebView.loadUrl("file://" + popupFile.absolutePath)
+        if (installedPopupRel != null) {
+            popupWebView.loadUrl("https://$EXT_VIRTUAL_HOST/$installedPopupRel")
+        }
+        refreshExtensionToolbarButton()
+        refreshPanelUi()
         injectExtensionIntoWebView(waWebView)
         tgWebView?.let { injectExtensionIntoWebView(it) }
         return true
     }
 
+    private fun removeInstalledExtension() {
+        File(filesDir, "installed_ext").deleteRecursively()
+        hasInstalledExtension = false
+        installedBaseDir = null
+        installedPopupRel = null
+        installedManifestText = "{}"
+        installedExtName = "Extension"
+        contentJsFiles = emptyList()
+        contentCssFiles = emptyList()
+        closePopup()
+        refreshExtensionToolbarButton()
+        refreshPanelUi()
+        Toast.makeText(this, "Extension removed", Toast.LENGTH_SHORT).show()
+    }
+
     private fun injectExtensionIntoWebView(wv: WebView) {
         wv.evaluateJavascript(CHROME_API_SHIM, null)
-        if (!isExtPopupEnabled) return
+        if (!hasInstalledExtension || !isExtPopupEnabled) return
         for (cssFile in contentCssFiles) {
             try {
                 val b64 = Base64.encodeToString(cssFile.readBytes(), Base64.NO_WRAP)
@@ -607,6 +793,7 @@ class MainActivity : AppCompatActivity() {
             mediaPlaybackRequiresUserGesture = false
             useWideViewPort = desktopSite
             loadWithOverviewMode = desktopSite
+            setSupportZoom(true)
             builtInZoomControls = true
             displayZoomControls = false
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
@@ -640,6 +827,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         wv.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                return interceptExtensionAsset(request) ?: super.shouldInterceptRequest(view, request)
+            }
+
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val host = request?.url?.host?.lowercase() ?: return true
                 return if (host in ALLOWED_HOSTS) {
@@ -660,7 +851,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        wv.webChromeClient = object : WebChromeClient() {
+        wv.webChromeClient = makeMediaChromeClient()
+    }
+
+    private fun makeMediaChromeClient(): WebChromeClient {
+        return object : WebChromeClient() {
             override fun onPermissionRequest(request: PermissionRequest?) {
                 if (request == null) return
                 val originHost = request.origin?.host?.lowercase()
@@ -698,17 +893,21 @@ class MainActivity : AppCompatActivity() {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Color.parseColor("#111720"))
+            setBackgroundColor(Color.parseColor("#0E141B"))
             setPadding(dp(8), dp(6), dp(8), dp(6))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(62)
+                dp(58)
             )
         }
 
-        val reloadBtn = makeToolbarButton("↻") { getActiveWebView().reload() }
+        backBtn = makeToolbarButton("←") {
+            val wv = getActiveWebView()
+            if (wv.canGoBack()) wv.goBack()
+        }
+        reloadBtn = makeToolbarButton("↻") { getActiveWebView().reload() }
         waSwitchBtn = makeToolbarButton("WA") { switchSite("wa") }.apply {
-            setBackgroundColor(Color.parseColor("#16A34A"))
+            styleButton(this, "#16A34A", "#22C55E")
         }
         tgSwitchBtn = makeToolbarButton("TG") { switchSite("tg") }
 
@@ -719,9 +918,7 @@ class MainActivity : AppCompatActivity() {
         desktopBtn = makeToolbarButton("Desktop") {
             desktopSite = !desktopSite
             desktopBtn.text = if (desktopSite) "Desktop" else "Mobile"
-            desktopBtn.setBackgroundColor(
-                Color.parseColor(if (desktopSite) "#16A34A" else "#1E293B")
-            )
+            styleButton(desktopBtn, if (desktopSite) "#16A34A" else "#161E29", if (desktopSite) "#22C55E" else "#293548")
             listOfNotNull(waWebView, tgWebView).forEach { wv ->
                 wv.settings.userAgentString = if (desktopSite) DESKTOP_UA else MOBILE_UA
                 wv.settings.useWideViewPort = desktopSite
@@ -729,43 +926,36 @@ class MainActivity : AppCompatActivity() {
                 wv.reload()
             }
         }.apply {
-            setBackgroundColor(Color.parseColor("#16A34A"))
+            styleButton(this, "#16A34A", "#22C55E")
         }
 
         permsBtn = makeToolbarButton("Perms") {
-            showPermissionsAndAudioDialog()
+            if (isPanelOpen && activePanelTab == "perms") closePanel() else openPanel("perms")
         }
 
-        extBtn = makeToolbarButton("+Zip") {
-            if (installedPopupFile == null) {
+        extNameBtn = makeToolbarButton("Ext") {
+            if (!hasInstalledExtension) {
                 extensionZipPicker.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
             } else if (!isExtPopupEnabled) {
-                Toast.makeText(this, "Disabled Popup — $installedExtName", Toast.LENGTH_SHORT).show()
-                AlertDialog.Builder(this)
-                    .setTitle(installedExtName)
-                    .setMessage("Disabled Popup. Enable extension popup or load a new .zip?")
-                    .setPositiveButton("Enable Popup") { _, _ ->
-                        isExtPopupEnabled = true
-                        extBtn.text = installedExtName.take(8)
-                        openPopup()
-                    }
-                    .setNeutralButton("Load .zip") { _, _ ->
-                        extensionZipPicker.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
-                    }
-                    .setNegativeButton("Cancel", null)
-                    .show()
-            } else if (!isPopupOpen) {
-                openPopup()
-            } else {
+                openPopupDisabledNotice()
+            } else if (installedPopupRel == null) {
+                openPanel("ext")
+            } else if (isPopupOpen) {
                 closePopup()
+            } else {
+                openPopup()
             }
-        }
-        extBtn.setOnLongClickListener {
-            extensionZipPicker.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
-            true
+        }.apply {
+            visibility = View.GONE
+            ellipsize = TextUtils.TruncateAt.END
+            maxLines = 1
         }
 
-        val posBtn = makeToolbarButton("Bar") {
+        addZipBtn = makeToolbarButton("+Zip") {
+            extensionZipPicker.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
+        }
+
+        posBtn = makeToolbarButton("Bar") {
             toolbarAtBottom = !toolbarAtBottom
             rootLayout.removeAllViews()
             if (toolbarAtBottom) {
@@ -777,15 +967,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        bar.addView(backBtn)
         bar.addView(reloadBtn)
         bar.addView(waSwitchBtn)
         bar.addView(tgSwitchBtn)
         bar.addView(spacer)
         bar.addView(desktopBtn)
         bar.addView(permsBtn)
-        bar.addView(extBtn)
+        bar.addView(extNameBtn)
+        bar.addView(addZipBtn)
         bar.addView(posBtn)
-        updatePermsButtonBadge()
         return bar
     }
 
@@ -794,14 +985,15 @@ class MainActivity : AppCompatActivity() {
             text = label
             textSize = 12f
             isAllCaps = false
+            typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#1E293B"))
-            setPadding(dp(10), dp(6), dp(10), dp(6))
-            minWidth = dp(44)
-            minimumWidth = dp(44)
+            styleButton(this, "#161E29", "#293548")
+            setPadding(dp(11), dp(4), dp(11), dp(4))
+            minWidth = dp(42)
+            minimumWidth = dp(42)
             val lp = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                dp(44)
+                dp(42)
             )
             lp.marginStart = dp(4)
             layoutParams = lp
@@ -809,49 +1001,96 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun openPopupDisabledNotice() {
+        closePanel()
+        isPopupOpen = true
+        popupTitleView.text = installedExtName
+        disabledNoticeText.text = "Disabled Popup — $installedExtName popup is disabled. Tap Enable Popup to open it again."
+        disabledNoticeBox.visibility = View.VISIBLE
+        popupWebView.visibility = View.GONE
+        popupCard.visibility = View.VISIBLE
+        refreshExtensionToolbarButton()
+        Toast.makeText(this, "Disabled Popup", Toast.LENGTH_SHORT).show()
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun buildExtensionPopupOverlay(): LinearLayout {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#141B24"))
+            background = makeRoundedBg("#111720", "#293548", 12)
             val lp = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
-                dp(360)
+                dp(380)
             )
-            lp.gravity = Gravity.BOTTOM
+            lp.gravity = Gravity.TOP or Gravity.END
             lp.setMargins(dp(10), dp(10), dp(10), dp(10))
             layoutParams = lp
-            elevation = 16f
+            elevation = 18f
         }
 
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Color.parseColor("#0E141B"))
+            setBackgroundColor(Color.parseColor("#0B1017"))
             setPadding(dp(12), dp(8), dp(12), dp(8))
         }
         popupTitleView = TextView(this).apply {
             text = "Extension Popup"
             setTextColor(Color.WHITE)
             textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         val disablePopupBtn = makeToolbarButton("Disable") {
             isExtPopupEnabled = false
-            extBtn.text = installedExtName.take(6) + " Off"
+            refreshExtensionToolbarButton()
+            refreshPanelUi()
             closePopup()
             Toast.makeText(this, "Disabled Popup", Toast.LENGTH_SHORT).show()
         }.apply {
-            setBackgroundColor(Color.parseColor("#92400E"))
-        }
-        val replaceBtn = makeToolbarButton("+Zip") {
-            extensionZipPicker.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
+            styleButton(this, "#92400E", "#D97706")
         }
         val closeBtn = makeToolbarButton("Close") { closePopup() }
         header.addView(popupTitleView)
         header.addView(disablePopupBtn)
-        header.addView(replaceBtn)
         header.addView(closeBtn)
+
+        disabledNoticeBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(20), dp(24), dp(20), dp(24))
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        }
+        val badge = TextView(this).apply {
+            text = "Disabled Popup"
+            setTextColor(Color.parseColor("#FBBF24"))
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }
+        disabledNoticeText = TextView(this).apply {
+            text = "Popup is disabled."
+            setTextColor(Color.parseColor("#94A3B8"))
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setPadding(0, dp(8), 0, dp(16))
+        }
+        val enableBtn = makeToolbarButton("Enable Popup") {
+            isExtPopupEnabled = true
+            refreshExtensionToolbarButton()
+            refreshPanelUi()
+            openPopup()
+        }.apply {
+            styleButton(this, "#16A34A", "#22C55E")
+        }
+        disabledNoticeBox.addView(badge)
+        disabledNoticeBox.addView(disabledNoticeText)
+        disabledNoticeBox.addView(enableBtn)
 
         popupWebView = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -861,32 +1100,204 @@ class MainActivity : AppCompatActivity() {
             )
             addJavascriptInterface(WaliteChromeBridge(), "__waliteNative")
             webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                    return interceptExtensionAsset(request) ?: super.shouldInterceptRequest(view, request)
+                }
+
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
                     view?.evaluateJavascript(CHROME_API_SHIM, null)
                 }
             }
+            webChromeClient = makeMediaChromeClient()
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
+            settings.mediaPlaybackRequiresUserGesture = false
             settings.allowFileAccess = true
-            @Suppress("DEPRECATION")
-            settings.allowFileAccessFromFileURLs = true
         }
 
         card.addView(header)
+        card.addView(disabledNoticeBox)
         card.addView(popupWebView)
         return card
     }
 
+    private fun buildChromiumDrawerOverlay(): LinearLayout {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = makeRoundedBg("#0E141B", "#293548", 12)
+            val lp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            lp.gravity = Gravity.TOP or Gravity.END
+            lp.setMargins(dp(10), dp(10), dp(10), dp(10))
+            layoutParams = lp
+            elevation = 20f
+        }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Color.parseColor("#0B1017"))
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+        }
+        panelTabPermsBtn = makeToolbarButton("Permissions & Audio") { switchPanelTab("perms") }
+        panelTabExtBtn = makeToolbarButton("Extensions (.zip)") { switchPanelTab("ext") }
+        val spacer = View(this).apply { layoutParams = LinearLayout.LayoutParams(0, 1, 1f) }
+        val closeBtn = makeToolbarButton("Close") { closePanel() }
+        header.addView(panelTabPermsBtn)
+        header.addView(panelTabExtBtn)
+        header.addView(spacer)
+        header.addView(closeBtn)
+
+        val scroller = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(390)
+            )
+        }
+        val bodyContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(14))
+        }
+
+        panelPermsBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        micStatusText = TextView(this).apply { textSize = 13f; setPadding(0, dp(4), 0, dp(4)) }
+        camStatusText = TextView(this).apply { textSize = 13f; setPadding(0, dp(4), 0, dp(4)) }
+        btStatusText = TextView(this).apply {
+            setTextColor(Color.parseColor("#CBD5E1"))
+            textSize = 13f
+            setPadding(0, dp(4), 0, dp(8))
+        }
+
+        val permActionsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(4), 0, dp(10))
+        }
+        val grantBtn = makeToolbarButton("Grant Mic & Camera") { requestRequiredPermissions() }.apply {
+            styleButton(this, "#16A34A", "#22C55E")
+        }
+        val appSettingsBtn = makeToolbarButton("Android Settings") {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.fromParts("package", packageName, null)
+            })
+        }
+        permActionsRow.addView(grantBtn)
+        permActionsRow.addView(appSettingsBtn)
+
+        val audioTitle = TextView(this).apply {
+            text = "Hardware Microphone & Headphones Devices"
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(6), 0, dp(4))
+        }
+        audioDevicesText = TextView(this).apply {
+            setTextColor(Color.parseColor("#94A3B8"))
+            textSize = 12f
+            setPadding(0, dp(2), 0, dp(10))
+        }
+
+        audioRouteBtn = makeToolbarButton("Output: Headphones / BT") {
+            applyAudioRouting(!useHeadphones)
+        }.apply {
+            styleButton(this, "#0284C7", "#38BDF8")
+        }
+        val testChimeBtn = makeToolbarButton("Test Headphones Chime") {
+            playHeadphoneTestChime()
+        }.apply {
+            styleButton(this, "#16A34A", "#22C55E")
+        }
+
+        panelPermsBody.addView(micStatusText)
+        panelPermsBody.addView(camStatusText)
+        panelPermsBody.addView(btStatusText)
+        panelPermsBody.addView(permActionsRow)
+        panelPermsBody.addView(audioTitle)
+        panelPermsBody.addView(audioDevicesText)
+        panelPermsBody.addView(audioRouteBtn)
+        val chimeWrap = LinearLayout(this).apply { setPadding(0, dp(6), 0, 0) }
+        chimeWrap.addView(testChimeBtn)
+        panelPermsBody.addView(chimeWrap)
+
+        panelExtBody = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        extStatusText = TextView(this).apply {
+            setTextColor(Color.parseColor("#E2E8F0"))
+            textSize = 13f
+            setPadding(0, dp(4), 0, dp(12))
+        }
+        val installExtBtn = makeToolbarButton("+ Install Extension (.zip)") {
+            closePanel()
+            extensionZipPicker.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
+        }.apply {
+            styleButton(this, "#16A34A", "#22C55E")
+        }
+        extTogglePopupBtn = makeToolbarButton("Disable Popup") {
+            isExtPopupEnabled = !isExtPopupEnabled
+            refreshExtensionToolbarButton()
+            refreshPanelUi()
+            Toast.makeText(this, if (isExtPopupEnabled) "Popup Enabled" else "Disabled Popup", Toast.LENGTH_SHORT).show()
+        }
+        val removeExtBtn = makeToolbarButton("Remove Extension") {
+            removeInstalledExtension()
+        }.apply {
+            styleButton(this, "#991B1B", "#EF4444")
+        }
+
+        panelExtBody.addView(extStatusText)
+        panelExtBody.addView(installExtBtn)
+        val extRow = LinearLayout(this).apply { setPadding(0, dp(8), 0, 0) }
+        extRow.addView(extTogglePopupBtn)
+        extRow.addView(removeExtBtn)
+        panelExtBody.addView(extRow)
+
+        bodyContainer.addView(panelPermsBody)
+        bodyContainer.addView(panelExtBody)
+        scroller.addView(bodyContainer)
+
+        card.addView(header)
+        card.addView(scroller)
+        return card
+    }
+
+    private fun switchPanelTab(tab: String) {
+        activePanelTab = tab
+        panelPermsBody.visibility = if (tab == "perms") View.VISIBLE else View.GONE
+        panelExtBody.visibility = if (tab == "ext") View.VISIBLE else View.GONE
+        styleButton(panelTabPermsBtn, if (tab == "perms") "#16A34A" else "#161E29", if (tab == "perms") "#22C55E" else "#293548")
+        styleButton(panelTabExtBtn, if (tab == "ext") "#16A34A" else "#161E29", if (tab == "ext") "#22C55E" else "#293548")
+        refreshPanelUi()
+    }
+
+    private fun openPanel(tab: String) {
+        closePopup()
+        isPanelOpen = true
+        panelCard.visibility = View.VISIBLE
+        switchPanelTab(tab)
+    }
+
+    private fun closePanel() {
+        isPanelOpen = false
+        panelCard.visibility = View.GONE
+    }
+
     private fun openPopup() {
+        closePanel()
         isPopupOpen = true
+        popupTitleView.text = installedExtName
+        disabledNoticeBox.visibility = View.GONE
+        popupWebView.visibility = View.VISIBLE
         popupCard.visibility = View.VISIBLE
-        extBtn.setBackgroundColor(Color.parseColor("#16A34A"))
+        refreshExtensionToolbarButton()
     }
 
     private fun closePopup() {
         isPopupOpen = false
         popupCard.visibility = View.GONE
-        extBtn.setBackgroundColor(Color.parseColor("#1E293B"))
+        refreshExtensionToolbarButton()
     }
 }
