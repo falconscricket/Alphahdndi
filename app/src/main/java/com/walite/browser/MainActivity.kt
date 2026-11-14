@@ -812,13 +812,13 @@ class MainActivity : AppCompatActivity() {
                 .setPlatform("Windows")
                 .setPlatformVersion("15.0.0")
                 .setArchitecture("x86")
-                .setBitness(UserAgentMetadata.BITNESS_64)
+                .setBitness(64)
                 .setMobile(false)
                 .build()
             WebSettingsCompat.setUserAgentMetadata(wv.settings, metadata)
         }
 
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_JAVASCRIPT)) {
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             WebViewCompat.addDocumentStartJavaScript(
                 wv,
                 CHROMIUM_DESKTOP_SHIM + "\n" + CHROME_API_SHIM,
